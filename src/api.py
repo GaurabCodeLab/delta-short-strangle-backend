@@ -1,0 +1,320 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from collections import deque
+from contextlib import asynccontextmanager
+from threading import Lock
+from typing import Any
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+
+from src.config import load_settings
+from src.exchange_client import DeltaExchangeClient
+from src.logging_config import setup_logging
+from src.order_executor import OrderExecutor
+from src.position_manager import PositionManager
+from src.strategy_engine import StrategyEngine
+
+
+class JsonLogHandler(logging.Handler):
+    def __init__(self, max_records: int = 1000) -> None:
+        super().__init__(level=logging.INFO)
+        self.records: deque[dict[str, Any]] = deque(maxlen=max_records)
+        self.records_lock = Lock()
+        self.setFormatter(logging.Formatter("%(message)s"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = self.format(record)
+        except Exception:
+            message = record.getMessage()
+
+        timestamp = None
+        if self.formatter is not None:
+            try:
+                timestamp = self.formatter.formatTime(record)
+            except Exception:
+                timestamp = None
+
+        payload: dict[str, Any] = {
+            "timestamp": timestamp,
+            "level": record.levelname,
+            "logger": record.name,
+            "message": message,
+        }
+
+        if message.startswith("{") and message.endswith("}"):
+            try:
+                payload["data"] = json.loads(message)
+            except Exception:
+                pass
+
+        with self.records_lock:
+            self.records.append(payload)
+
+    def latest(self, limit: int | None = None) -> list[dict[str, Any]]:
+        with self.records_lock:
+            records = list(self.records)
+        if limit is None:
+            return records
+        return records[-limit:]
+
+
+class BotManager:
+    def __init__(self, strategy: StrategyEngine) -> None:
+        self.strategy = strategy
+        self._task: asyncio.Task | None = None
+        self._lock = Lock()
+        self._logger = logging.getLogger(__name__)
+
+    def start(self) -> dict[str, Any]:
+        with self._lock:
+            if self._task is not None and not self._task.done():
+                self._logger.info("Bot start requested but bot is already running")
+                return {"status": "already_running", "running": True}
+            self._task = asyncio.create_task(self.strategy.run())
+            self._logger.info("Bot start requested and strategy launched")
+            return {"status": "started", "running": True}
+
+    async def collect_summary(self) -> dict[str, Any]:
+        exchange = self.strategy.exchange
+        logger = logging.getLogger(__name__)
+
+        try:
+            index_price = await exchange.get_index_price("BTCUSDT")
+            logger.info(f"Index price fetched: {index_price}")
+        except Exception as e:
+            logger.error(f"Failed to fetch index price: {str(e)}")
+            raise
+
+        try:
+            legs = await exchange.parse_option_positions()
+            logger.info(f"Parsed {len(legs)} option positions")
+        except Exception as e:
+            logger.error(f"Failed to parse option positions: {str(e)}")
+            raise
+
+        total_pnl = 0.0
+        positions: list[dict[str, Any]] = []
+
+        for leg in legs:
+            try:
+                # Add 4 second timeout per quote fetch
+                quote = await asyncio.wait_for(
+                    exchange.get_best_quote(leg.product_id),
+                    timeout=4.0
+                )
+                qty = abs(leg.size)
+
+                # Validate quote data before calculations
+                if quote.best_bid is None or quote.best_ask is None:
+                    logger.warning(f"Invalid quote for product {leg.product_id}: bid={quote.best_bid}, ask={quote.best_ask}")
+                    continue
+
+                # Calculate PnL safely
+                if leg.size > 0:
+                    pnl = qty * leg.contract_value * (float(quote.best_bid) - float(leg.entry_price))
+                else:
+                    pnl = qty * leg.contract_value * (float(leg.entry_price) - float(quote.best_ask))
+
+                total_pnl += pnl
+                positions.append(
+                    {
+                        "product_id": leg.product_id,
+                        "symbol": leg.symbol,
+                        "option_type": leg.option_type,
+                        "strike": leg.strike,
+                        "expiry": leg.expiry.isoformat() if leg.expiry is not None else None,
+                        "size": leg.size,
+                        "entry_price": leg.entry_price,
+                        "contract_value": leg.contract_value,
+                        "best_bid": quote.best_bid,
+                        "best_ask": quote.best_ask,
+                        "current_pnl": pnl,
+                    }
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout fetching quote for product {leg.product_id}")
+                continue
+            except Exception as e:
+                logger.error(f"Error processing position for product {leg.product_id}: {str(e)}")
+                continue
+
+        closed_positions = getattr(self.strategy, "closed_positions", None)
+        if closed_positions is None:
+            closed_positions = []
+        if not isinstance(closed_positions, list):
+            closed_positions = list(closed_positions)
+
+        normalized_closed = []
+        for entry in closed_positions:
+            normalized_closed.append(
+                {
+                    "product_id": entry.get("product_id"),
+                    "symbol": entry.get("symbol"),
+                    "option_type": entry.get("option_type"),
+                    "strike": entry.get("strike"),
+                    "expiry": entry.get("expiry"),
+                    "side": entry.get("side"),
+                    "size": entry.get("size"),
+                    "entry_price": entry.get("entry_price"),
+                    "closed_price": entry.get("closed_price"),
+                    "closed_time": entry.get("closed_time"),
+                    "realized_pnl": entry.get("realized_pnl"),
+                }
+            )
+
+        realized_pnl = sum(float(entry.get("realized_pnl", 0.0) or 0.0) for entry in normalized_closed)
+        logger.info(
+            "Summary collected: %s open positions, %s closed positions, unrealized_pnl=%s realized_pnl=%s",
+            len(positions),
+            len(normalized_closed),
+            total_pnl,
+            realized_pnl,
+        )
+
+        return {
+            "index_price": index_price,
+            "unrealized_pnl": total_pnl,
+            "realized_pnl": realized_pnl,
+            "position_count": len(positions),
+            "positions": positions,
+            "closed_positions": normalized_closed,
+            "closed_position_count": len(normalized_closed),
+            "strategy_state": self.status()["strategy_state"],
+        }
+
+    def stop(self) -> dict[str, Any]:
+        with self._lock:
+            if self._task is None or self._task.done():
+                self._logger.info("Bot stop requested but bot was not running")
+                return {"status": "not_running", "running": False}
+            self._task.cancel()
+            self._logger.info("Bot stop requested and strategy task canceled")
+            return {"status": "stopped", "running": False}
+
+    async def refresh_live_state(self) -> None:
+        refresh = getattr(self.strategy, "refresh_live_state", None)
+        if callable(refresh):
+            await refresh()
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            running = self._task is not None and not self._task.done()
+        strategy_state = {
+            "triggered": self.strategy.state.triggered,
+            "last_index_price": self.strategy.state.last_index_price,
+            "previous_index_price": self.strategy.state.previous_index_price,
+            "reference_strike": self.strategy.state.reference_strike,
+            "current_structure": self.strategy.state.current_structure,
+            "threshold": self.strategy.state.threshold,
+            "last_transition": self.strategy.state.last_transition,
+            "combined_pnl": self.strategy.state.combined_pnl,
+            "profit_target": self.strategy.state.profit_target,
+            "stop_loss": self.strategy.state.stop_loss,
+            "exit_reason": self.strategy.state.exit_reason,
+            "status_message": self.strategy.state.status_message,
+            "action": self.strategy.state.action,
+            "status": self.strategy.state.status,
+            "trigger_price": self.strategy.state.trigger_price,
+            "trigger_pnl": self.strategy.state.trigger_pnl,
+            "iron_fly_breakevens": getattr(self.strategy.state, "iron_fly_breakevens", None),
+        }
+
+        if not self.strategy.state.status_message:
+            strategy_state["status_message"] = self.strategy.state.status_message or "waiting for strategy state"
+
+        return {
+            "running": running,
+            "strategy_state": strategy_state,
+        }
+
+def build_strategy() -> StrategyEngine:
+    settings = load_settings()
+    exchange = DeltaExchangeClient(
+        api_key=settings.api_key,
+        api_secret=settings.api_secret,
+        base_url=settings.base_url,
+        ssl_verify=settings.ssl_verify,
+    )
+    positions = PositionManager(exchange)
+    executor = OrderExecutor(exchange)
+    return StrategyEngine(exchange, positions, executor, settings)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    setup_logging("INFO")
+    logging.getLogger().addHandler(log_handler)
+    logging.getLogger(__name__).info("Delta BTC Options API starting")
+    yield
+    logging.getLogger(__name__).info("Delta BTC Options API shutting down")
+    logging.getLogger().removeHandler(log_handler)
+    manager.stop()
+
+
+app = FastAPI(title="Delta BTC Options API", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=3600,
+)
+
+log_handler = JsonLogHandler(max_records=2000)
+
+strategy = build_strategy()
+manager = BotManager(strategy)
+
+
+@app.get("/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.post("/start")
+async def api_start() -> dict[str, Any]:
+    logging.getLogger(__name__).info("API /start called")
+    return manager.start()
+
+
+@app.post("/stop")
+async def api_stop() -> dict[str, Any]:
+    logging.getLogger(__name__).info("API /stop called")
+    return manager.stop()
+
+
+@app.get("/status")
+async def api_status() -> dict[str, Any]:
+    logging.getLogger(__name__).info("API /status called")
+    await manager.refresh_live_state()
+    return manager.status()
+
+
+@app.get("/summary")
+async def api_summary() -> dict[str, Any]:
+    logger = logging.getLogger(__name__)
+    logger.info("API /summary called")
+    try:
+        await manager.refresh_live_state()
+        return await manager.collect_summary()
+    except Exception as exc:
+        logger.exception("Summary API error")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to collect summary: {str(exc)}"
+        )
+
+
+@app.get("/logs")
+async def api_logs(limit: int | None = None) -> dict[str, Any]:
+    logger = logging.getLogger(__name__)
+    logger.info("API /logs called with limit=%s", limit)
+    latest_logs = log_handler.latest(limit)
+    return {"count": len(latest_logs), "logs": latest_logs}
