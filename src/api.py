@@ -64,11 +64,21 @@ class JsonLogHandler(logging.Handler):
 
 
 class BotManager:
-    def __init__(self, strategy: StrategyEngine) -> None:
-        self.strategy = strategy
+    def __init__(self, strategy: StrategyEngine | None = None) -> None:
+        self._strategy = strategy
         self._task: asyncio.Task | None = None
         self._lock = Lock()
         self._logger = logging.getLogger(__name__)
+
+    @property
+    def strategy(self) -> StrategyEngine:
+        if self._strategy is None:
+            raise RuntimeError("Bot manager has not been initialized")
+        return self._strategy
+
+    @strategy.setter
+    def strategy(self, strategy: StrategyEngine) -> None:
+        self._strategy = strategy
 
     def start(self) -> dict[str, Any]:
         with self._lock:
@@ -197,6 +207,8 @@ class BotManager:
             return {"status": "stopped", "running": False}
 
     async def refresh_live_state(self) -> None:
+        if self._strategy is None:
+            return
         refresh = getattr(self.strategy, "refresh_live_state", None)
         if callable(refresh):
             await refresh()
@@ -247,13 +259,18 @@ def build_strategy() -> StrategyEngine:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    global strategy
     setup_logging("INFO")
     logging.getLogger().addHandler(log_handler)
-    logging.getLogger(__name__).info("Delta BTC Options API starting")
-    yield
-    logging.getLogger(__name__).info("Delta BTC Options API shutting down")
-    logging.getLogger().removeHandler(log_handler)
-    manager.stop()
+    try:
+        logging.getLogger(__name__).info("Delta BTC Options API starting")
+        strategy = build_strategy()
+        manager.strategy = strategy
+        yield
+    finally:
+        logging.getLogger(__name__).info("Delta BTC Options API shutting down")
+        logging.getLogger().removeHandler(log_handler)
+        manager.stop()
 
 
 app = FastAPI(title="Delta BTC Options API", lifespan=lifespan)
@@ -269,8 +286,8 @@ app.add_middleware(
 
 log_handler = JsonLogHandler(max_records=2000)
 
-strategy = build_strategy()
-manager = BotManager(strategy)
+strategy: StrategyEngine | None = None
+manager = BotManager()
 
 
 @app.get("/health")

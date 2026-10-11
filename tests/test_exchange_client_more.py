@@ -432,6 +432,49 @@ async def test_exchange_client_handles_nested_result_dicts_and_positions_variant
 
 
 @pytest.mark.asyncio
+async def test_open_positions_wraps_transport_errors():
+    class FailingClient(DeltaExchangeClient):
+        def __init__(self):
+            pass
+
+        async def _call(self, method_name: str, **kwargs):
+            raise OSError("connection reset")
+
+    client = FailingClient()
+
+    with pytest.raises(ExchangeClientError, match="Unable to fetch open positions") as error:
+        await client.get_open_positions_raw()
+
+    assert "connection reset" in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_order_executor_reports_partial_fill_from_position_delta():
+    class PartialFillExchange:
+        def __init__(self):
+            self.position_sizes = iter([5.0, 3.5])
+
+        async def get_position_size(self, product_id: int):
+            return next(self.position_sizes)
+
+        async def place_market_order(self, **kwargs):
+            return {"result": {"id": "partial-order"}}
+
+    executor = OrderExecutor(PartialFillExchange())
+
+    filled = await executor.execute_market_single_submission_with_fill_confirmation(
+        product_id=20,
+        side="sell",
+        size=4.0,
+        reduce_only=False,
+    )
+
+    assert filled == pytest.approx(1.5)
+    assert executor.last_fill_details["filled_qty"] == pytest.approx(1.5)
+    assert executor.last_fill_details["avg_fill_price"] is None
+
+
+@pytest.mark.asyncio
 async def test_order_executor_handles_order_history_error_and_direct_close_payloads():
     class E:
         def __init__(self):

@@ -104,6 +104,7 @@ def settings():
         strike_adjustment_threshold=1000.0,
         profit_target=50.0,
         stop_loss=100.0,
+        adjustment_multiplier=2.0,
         log_level="INFO",
         ssl_verify=False,
     )
@@ -185,6 +186,8 @@ async def test_monitor_dynamic_straddle_strangle_keeps_monitoring_until_threshol
 
 @pytest.mark.asyncio
 async def test_monitor_dynamic_straddle_strangle_checks_threshold_without_blocking_on_straddle_monitor(settings):
+    settings.poll_interval_seconds = 0.001
+
     class SequenceExchange(DummyExchange):
         def __init__(self, values):
             super().__init__()

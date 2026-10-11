@@ -102,6 +102,46 @@ def test_is_valid_short_straddle_and_strangle():
     assert StrategyEngine._is_valid_short_strangle(strangle2) is True
 
 
+def test_structure_validators_reject_missing_mismatched_and_non_short_legs():
+    expiry = datetime.now(timezone.utc) + timedelta(days=7)
+    put = OptionLeg(1, "P", "put", 90, expiry, -1, 2, 1)
+    call = OptionLeg(2, "C", "call", 110, expiry, -1, 2, 1)
+    long_call = OptionLeg(3, "LC", "call", 110, expiry, 1, 2, 1)
+    other_expiry = OptionLeg(4, "C2", "call", 110, expiry + timedelta(days=1), -1, 2, 1)
+    wrong_put = OptionLeg(5, "P2", "call", 90, expiry, -1, 2, 1)
+    wrong_call = OptionLeg(7, "C2", "put", 110, expiry, -1, 2, 1)
+    equal_call = OptionLeg(8, "C4", "call", 90, expiry, -1, 2, 1)
+    unequal_size = OptionLeg(6, "C3", "call", 110, expiry, -2, 2, 1)
+
+    assert StrategyEngine._is_valid_short_straddle(None) is False
+    assert StrategyEngine._is_valid_short_straddle(ShortStraddle(None, call)) is False
+    assert StrategyEngine._is_valid_short_straddle(ShortStraddle(wrong_put, call)) is False
+    assert StrategyEngine._is_valid_short_straddle(ShortStraddle(put, other_expiry)) is False
+    assert StrategyEngine._is_valid_short_straddle(ShortStraddle(put, long_call)) is False
+    assert StrategyEngine._is_valid_short_straddle(ShortStraddle(put, unequal_size)) is False
+
+    assert StrategyEngine._is_valid_short_strangle(None) is False
+    assert StrategyEngine._is_valid_short_strangle(ShortStrangle(None, call)) is False
+    assert StrategyEngine._is_valid_short_strangle(ShortStrangle(put, wrong_call)) is False
+    assert StrategyEngine._is_valid_short_strangle(ShortStrangle(put, other_expiry)) is False
+    assert StrategyEngine._is_valid_short_strangle(ShortStrangle(put, long_call)) is False
+    assert StrategyEngine._is_valid_short_strangle(ShortStrangle(put, equal_call)) is False
+    assert StrategyEngine._is_valid_short_strangle(ShortStrangle(put, unequal_size)) is False
+
+
+def test_leg_market_value_and_realized_pnl_respect_side_quantity_and_contract_value():
+    expiry = datetime.now(timezone.utc) + timedelta(days=7)
+    short = OptionLeg(1, "P", "put", 90, expiry, -2, 3, 1.5)
+    long = OptionLeg(2, "C", "call", 110, expiry, 2, 3, 1.5)
+    quote = Quote(best_bid=4, best_ask=5)
+
+    assert StrategyEngine._compute_leg_market_value(short, quote) == pytest.approx(15)
+    assert StrategyEngine._calculate_realized_pnl_from_close(short, quote) == pytest.approx(-6)
+    assert StrategyEngine._calculate_realized_pnl_from_close(long, quote) == pytest.approx(3)
+    assert StrategyEngine._calculate_realized_pnl_from_fill_price(short, 5) == pytest.approx(-6)
+    assert StrategyEngine._calculate_realized_pnl_from_fill_price(long, 5, filled_qty=1) == pytest.approx(3)
+
+
 def test_crossed_or_touched_behaviour():
     # exact touch
     assert StrategyEngine._crossed_or_touched(None, 100.0, 100.0, "call") is True

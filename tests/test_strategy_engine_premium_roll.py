@@ -35,8 +35,12 @@ class FakePositions:
     def __init__(self, replacement=None, wings=None):
         self.replacement = replacement
         self.wings = wings or {}
+        self.replacement_requests = []
 
     async def get_option_product_closest_to_premium(self, **kwargs):
+        self.replacement_requests.append(kwargs)
+        if isinstance(self.replacement, list):
+            return self.replacement.pop(0)
         return self.replacement
 
     async def get_option_product_for_strike(self, option_type, strike, expiry, **kwargs):
@@ -66,7 +70,7 @@ class FakeExecutor:
 
 @pytest.fixture
 def settings():
-    return Settings("key", "secret", "test", 0.001, 10.0, 1e9, 1e9, "INFO", False)
+    return Settings("key", "secret", "test", 0.001, 10.0, 1e9, 1e9, 2.0, "INFO", False)
 
 
 def make_engine(exchange, positions, executor, settings):
@@ -90,7 +94,7 @@ async def test_waits_for_preexisting_matching_short_pair(settings):
 @pytest.mark.asyncio
 async def test_roll_closes_triggered_leg_before_opening_replacement(settings):
     put = make_leg(1, "put", 90, -1, 2)
-    call = make_leg(2, "call", 110, -1, 3)
+    call = make_leg(2, "call", 110, -1, 1.5)
     replacement_leg = make_leg(3, "put", 100, -1, 2.8)
     exchange = FakeExchange(
         [put, call],
@@ -106,29 +110,120 @@ async def test_roll_closes_triggered_leg_before_opening_replacement(settings):
     executor = FakeExecutor(exchange, {3: replacement_leg})
     engine = make_engine(exchange, positions, executor, settings)
 
-    await engine._roll_short_leg(put, call, exchange.quotes[2])
+    await engine._roll_short_leg(call, put)
 
     assert executor.calls == [(1, "buy", 1, True), (3, "sell", 1, False)]
     assert [leg.product_id for leg in exchange.legs] == [2, 3]
+    assert positions.replacement_requests[0]["target_premium"] == 3.0
+    assert engine._reference_premiums["call"] == 3.0
+    assert engine._managed_legs[3].entry_price == 2.8
 
 
 @pytest.mark.asyncio
-async def test_monitor_rolls_only_the_leg_that_reaches_double_premium(settings):
+async def test_roll_does_nothing_below_configured_trigger(settings):
+    settings.adjustment_multiplier = 2.5
     put = make_leg(1, "put", 90, -1, 2)
-    call = make_leg(2, "call", 110, -1, 3)
-    replacement = make_leg(3, "put", 95, -1, 2.8)
+    call = make_leg(2, "call", 110, -1, 2)
+    exchange = FakeExchange([put, call], {1: Quote(4.8, 4.9), 2: Quote(2.0, 2.1)})
+    executor = FakeExecutor(exchange)
+    engine = make_engine(exchange, FakePositions({"id": 3}), executor, settings)
+    engine._reference_premiums["call"] = 2.0
+
+    await engine._roll_short_leg(call, put)
+
+    assert executor.calls == []
+    assert engine._reference_premiums["call"] == 2.0
+
+
+@pytest.mark.asyncio
+async def test_roll_keeps_both_legs_when_no_replacement_is_available(settings):
+    put = make_leg(1, "put", 90, -1, 2)
+    call = make_leg(2, "call", 110, -1, 2)
+    exchange = FakeExchange([put, call], {1: Quote(3.0, 4.0), 2: Quote(3.0, 4.0)})
+    positions = FakePositions(None)
+    executor = FakeExecutor(exchange)
+    engine = make_engine(exchange, positions, executor, settings)
+
+    await engine._roll_short_leg(call, put)
+
+    assert executor.calls == []
+    assert exchange.legs == [put, call]
+    assert engine._reference_premiums["call"] == call.entry_price
+
+
+@pytest.mark.asyncio
+async def test_roll_rejects_wrong_expiry_before_closing_any_leg(settings):
+    put = make_leg(1, "put", 90, -1, 2)
+    call = make_leg(2, "call", 110, -1, 2)
+    exchange = FakeExchange([put, call], {1: Quote(3.0, 4.0), 2: Quote(3.0, 4.0), 3: Quote(2.8, 3.0)})
+    replacement = {
+        "id": 3,
+        "symbol": "P-100",
+        "strike_price": 100,
+        "settlement_time": datetime(2027, 1, 31, tzinfo=timezone.utc).isoformat(),
+    }
+    executor = FakeExecutor(exchange)
+    engine = make_engine(exchange, FakePositions(replacement), executor, settings)
+
+    with pytest.raises(RuntimeError, match="active expiry"):
+        await engine._roll_short_leg(call, put)
+
+    assert executor.calls == []
+    assert exchange.legs == [put, call]
+
+
+@pytest.mark.asyncio
+async def test_partial_close_reconciles_position_and_does_not_open_replacement(settings):
+    put = make_leg(1, "put", 90, -1, 2)
+    call = make_leg(2, "call", 110, -1, 2)
+    exchange = FakeExchange([put, call], {1: Quote(3.0, 4.0), 2: Quote(3.0, 4.0), 3: Quote(2.8, 3.0)})
+    product = {
+        "id": 3,
+        "symbol": "P-100",
+        "strike_price": 100,
+        "settlement_time": EXPIRY.isoformat(),
+    }
+
+    class PartialCloseExecutor(FakeExecutor):
+        async def execute_market_single_submission_with_fill_confirmation(self, product_id, side, size, reduce_only):
+            self.calls.append((product_id, side, size, reduce_only))
+            return size / 2 if reduce_only else size
+
+    executor = PartialCloseExecutor(exchange)
+    engine = make_engine(exchange, FakePositions(product), executor, settings)
+    engine._managed_legs = {put.product_id: put, call.product_id: call}
+
+    with pytest.raises(RuntimeError, match="Close was not fully filled"):
+        await engine._roll_short_leg(call, put)
+
+    assert executor.calls == [(1, "buy", 1, True)]
+    assert engine._managed_legs[put.product_id] is put
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("trigger_type", "multiplier"), [("put", 1.5), ("call", 2.5)])
+async def test_monitor_rolls_only_the_leg_that_reaches_configured_trigger(settings, trigger_type, multiplier):
+    settings.adjustment_multiplier = multiplier
+    put = make_leg(1, "put", 90, -1, 2)
+    call = make_leg(2, "call", 110, -1, 2)
+    trigger_id = 1 if trigger_type == "put" else 2
+    replaced_id = 2 if trigger_type == "put" else 1
+    replacement_type = "call" if trigger_type == "put" else "put"
+    replacement_strike = 105 if replacement_type == "call" else 95
+    trigger_premium = multiplier * 2
+    replacement = make_leg(3, replacement_type, replacement_strike, -1, 2.8)
     exchange = FakeExchange(
         [put, call],
         {
-            1: Quote(3.0, 4.0),
-            2: Quote(2.8, 3.0),
+            1: Quote(trigger_premium - 0.1, trigger_premium) if trigger_type == "put" else Quote(1.9, 2.0),
+            2: Quote(trigger_premium - 0.1, trigger_premium) if trigger_type == "call" else Quote(1.9, 2.0),
             3: Quote(2.7, 2.9),
         },
     )
     product = {
         "id": 3,
-        "symbol": "P-95",
-        "strike_price": 95,
+        "symbol": f"{replacement_type}-{replacement_strike}",
+        "strike_price": replacement_strike,
         "settlement_time": EXPIRY.isoformat(),
         "contract_value": 1,
     }
@@ -142,8 +237,49 @@ async def test_monitor_rolls_only_the_leg_that_reaches_double_premium(settings):
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert executor.calls[:2] == [(1, "buy", 1, True), (3, "sell", 1, False)]
-    assert [leg.product_id for leg in exchange.legs] == [2, 3]
+    assert executor.calls[:2] == [(replaced_id, "buy", 1, True), (3, "sell", 1, False)]
+    assert sorted(leg.product_id for leg in exchange.legs) == sorted([trigger_id, 3])
+    assert engine._reference_premiums[trigger_type] == trigger_premium
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("multiplier", "first_trigger", "second_trigger"), [(1.5, 3.0, 4.5), (2.5, 5.0, 12.5)])
+async def test_repeated_call_adjustment_uses_configured_latest_reference(settings, multiplier, first_trigger, second_trigger):
+    settings.adjustment_multiplier = multiplier
+    put = make_leg(1, "put", 90, -1, 2)
+    call = make_leg(2, "call", 110, -1, 2)
+    first_replacement = make_leg(3, "put", 95, -1, 2.8)
+    second_replacement = make_leg(4, "put", 100, -1, 5.8)
+    first_product = {
+        "id": 3, "symbol": "P-95", "strike_price": 95,
+        "settlement_time": EXPIRY.isoformat(), "contract_value": 1,
+    }
+    second_product = {
+        "id": 4, "symbol": "P-100", "strike_price": 100,
+        "settlement_time": EXPIRY.isoformat(), "contract_value": 1,
+    }
+    exchange = FakeExchange(
+        [put, call],
+        {
+            1: Quote(1.9, 2.0), 2: Quote(first_trigger - 0.1, first_trigger),
+            3: Quote(2.7, 2.9), 4: Quote(5.5, 5.9),
+        },
+    )
+    positions = FakePositions([first_product, second_product])
+    executor = FakeExecutor(exchange, {3: first_replacement, 4: second_replacement})
+    engine = make_engine(exchange, positions, executor, settings)
+
+    await engine._roll_short_leg(call, put)
+    exchange.quotes[2] = Quote(second_trigger - 0.1, second_trigger)
+    await engine._roll_short_leg(call, exchange.legs[1])
+
+    assert executor.calls == [
+        (1, "buy", 1, True), (3, "sell", 1, False),
+        (3, "buy", 1, True), (4, "sell", 1, False),
+    ]
+    assert [request["target_premium"] for request in positions.replacement_requests] == [first_trigger, second_trigger]
+    assert engine._reference_premiums["call"] == second_trigger
+    assert engine._managed_legs[4].entry_price == 5.8
 
 
 def test_iron_fly_breakevens_include_hedge_debit_and_realized_pnl(settings):
@@ -170,7 +306,33 @@ async def test_strategy_exit_submits_closes_only_once(settings):
     await engine._exit_strategy("profit")
 
     assert executor.calls == [(1, "buy", 1, True)]
-    assert engine.state.status == "Completed - Profit"
+    assert engine.state.status == "Completed - Profit Target Reached"
+
+
+@pytest.mark.asyncio
+async def test_exit_attempts_remaining_legs_after_one_close_fails(settings):
+    put = make_leg(1, "put", 90, -1, 2)
+    call = make_leg(2, "call", 110, -1, 2)
+    exchange = FakeExchange([put, call], {1: Quote(1, 2), 2: Quote(1, 2)})
+
+    class OneCloseFailsExecutor(FakeExecutor):
+        async def execute_market_single_submission_with_fill_confirmation(self, product_id, side, size, reduce_only):
+            self.calls.append((product_id, side, size, reduce_only))
+            if product_id == 1:
+                raise RuntimeError("exchange rejected close")
+            self.exchange.legs = [leg for leg in self.exchange.legs if leg.product_id != product_id]
+            return size
+
+    executor = OneCloseFailsExecutor(exchange)
+    engine = make_engine(exchange, FakePositions(), executor, settings)
+    engine._managed_legs = {put.product_id: put, call.product_id: call}
+
+    with pytest.raises(RuntimeError, match="Failed to close all option positions"):
+        await engine._exit_strategy("stop_loss")
+    await engine._exit_strategy("stop_loss")
+
+    assert executor.calls == [(1, "buy", 1, True), (2, "buy", 1, True)]
+    assert engine.state.status == "exit failed"
 
 
 @pytest.mark.asyncio

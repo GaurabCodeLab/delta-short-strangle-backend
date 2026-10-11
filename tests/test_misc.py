@@ -160,6 +160,7 @@ def test_load_settings_valid_and_missing_env_values(monkeypatch):
     monkeypatch.setenv("STRIKE_ADJUSTMENT_THRESHOLD", "1500")
     monkeypatch.setenv("PROFIT_TARGET", "25")
     monkeypatch.setenv("STOP_LOSS", "75")
+    monkeypatch.setenv("ADJUSTMENT_MULTIPLIER", "1.5")
     monkeypatch.setenv("LOG_LEVEL", "DEBUG")
     monkeypatch.setenv("DELTA_SSL_VERIFY", "true")
 
@@ -171,11 +172,35 @@ def test_load_settings_valid_and_missing_env_values(monkeypatch):
     assert settings.strike_adjustment_threshold == 1500.0
     assert settings.profit_target == 25.0
     assert settings.stop_loss == 75.0
+    assert settings.adjustment_multiplier == 1.5
     assert settings.log_level == "DEBUG"
     assert settings.ssl_verify is True
 
     monkeypatch.delenv("DELTA_API_KEY", raising=False)
     with pytest.raises(ValueError, match="Missing DELTA_API_KEY"):
+        load_settings()
+
+
+@pytest.mark.parametrize("value", ["", "abc", "0", "-1", "nan", "inf"])
+def test_load_settings_rejects_invalid_adjustment_multiplier(monkeypatch, value):
+    monkeypatch.setenv("DELTA_API_KEY", "key")
+    monkeypatch.setenv("DELTA_API_SECRET", "secret")
+    monkeypatch.setenv("ADJUSTMENT_MULTIPLIER", value)
+
+    from src.config import load_settings
+
+    with pytest.raises(ValueError, match="ADJUSTMENT_MULTIPLIER"):
+        load_settings()
+
+
+def test_load_settings_requires_adjustment_multiplier(monkeypatch):
+    monkeypatch.setenv("DELTA_API_KEY", "key")
+    monkeypatch.setenv("DELTA_API_SECRET", "secret")
+    monkeypatch.delenv("ADJUSTMENT_MULTIPLIER", raising=False)
+
+    from src.config import load_settings
+
+    with pytest.raises(ValueError, match="Missing ADJUSTMENT_MULTIPLIER"):
         load_settings()
 
 
@@ -221,6 +246,32 @@ async def test_bot_manager_collect_summary_handles_quote_timeout():
     summary = await manager.collect_summary()
     assert summary["position_count"] == 0
     assert summary["unrealized_pnl"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_bot_manager_summary_skips_quote_fetch_errors():
+    class BrokenQuoteExchange(DummySummaryExchange):
+        async def get_best_quote(self, product_id: int):
+            raise RuntimeError("quote endpoint unavailable")
+
+    strategy = DummyStrategy()
+    strategy.exchange = BrokenQuoteExchange()
+    manager = BotManager(strategy)
+
+    summary = await manager.collect_summary()
+
+    assert summary["position_count"] == 0
+    assert summary["unrealized_pnl"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_uninitialized_bot_manager_refresh_is_safe_before_startup():
+    manager = BotManager()
+
+    await manager.refresh_live_state()
+
+    with pytest.raises(RuntimeError, match="not been initialized"):
+        manager.start()
 
 
 @pytest.mark.asyncio
@@ -459,6 +510,7 @@ async def test_lifespan_context_manager_registers_and_removes_handler(monkeypatc
 
     handler = JsonLogHandler(max_records=3)
     monkeypatch.setattr(api_module, "log_handler", handler)
+    monkeypatch.setattr(api_module, "build_strategy", DummyStrategy)
     root_logger = logging.getLogger()
     before_count = len(root_logger.handlers)
 
@@ -942,6 +994,7 @@ def settings():
         strike_adjustment_threshold=1000.0,
         profit_target=50.0,
         stop_loss=100.0,
+        adjustment_multiplier=2.0,
         log_level="INFO",
         ssl_verify=False,
     )

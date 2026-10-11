@@ -95,6 +95,7 @@ python -m pytest tests/test_strategy_workflow.py -k test_short_straddle_monitor_
 - `POLL_INTERVAL_SECONDS` (default: `0.2`)
 - `PROFIT_TARGET` (default: `50`)
 - `STOP_LOSS` (default: `100`)
+- `ADJUSTMENT_MULTIPLIER` (required, positive finite number; example: `2`)
 - `LOG_LEVEL` (default: `INFO`)
 
 Heartbeat logs run on the same interval as `POLL_INTERVAL_SECONDS`.

@@ -147,3 +147,90 @@ async def test_strike_lookup_respects_iron_fly_wing_bounds():
     product = await manager.get_option_product_for_strike("call", 99, expiry, min_strike=100)
 
     assert product["id"] == 1
+
+
+@pytest.mark.asyncio
+async def test_option_cache_skips_bad_metadata_and_is_reused():
+    expiry = datetime(2026, 12, 31, tzinfo=timezone.utc)
+
+    class Exchange:
+        def __init__(self):
+            self.product_fetches = 0
+
+        async def get_products_raw(self):
+            self.product_fetches += 1
+            return [
+                {"id": 1, "contract_type": "perpetual_futures", "strike_price": "100", "settlement_time": expiry.isoformat()},
+                {"id": 2, "contract_type": "put_options", "strike_price": "bad", "settlement_time": expiry.isoformat()},
+                {"id": 3, "contract_type": "call_options", "strike_price": "100", "settlement_time": "not-a-date"},
+                {"id": 4, "contract_type": "put_options", "strike_price": "100", "settlement_time": expiry.isoformat()},
+            ]
+
+    exchange = Exchange()
+    manager = PositionManager(exchange)
+
+    result = await manager.get_option_product_for_strike("put", 100, expiry)
+    repeated = await manager.get_option_product_for_strike("put", 100, expiry)
+
+    assert result["id"] == repeated["id"] == 4
+    assert exchange.product_fetches == 1
+
+
+@pytest.mark.asyncio
+async def test_premium_lookup_returns_none_when_candidates_have_no_usable_quotes():
+    expiry = datetime(2026, 12, 31, tzinfo=timezone.utc)
+
+    class Exchange:
+        async def get_products_raw(self):
+            return [
+                {"id": 1, "contract_type": "put_options", "strike_price": "90", "settlement_time": expiry.isoformat(), "state": "live"},
+                {"id": 2, "contract_type": "put_options", "strike_price": "95", "settlement_time": expiry.isoformat(), "state": "expired"},
+            ]
+
+        async def get_best_quote(self, product_id):
+            raise RuntimeError("quote unavailable")
+
+    active = OptionLeg(10, "P-90", "put", 90, expiry, -1, 1)
+    remaining = OptionLeg(11, "C-110", "call", 110, expiry, -1, 1)
+    manager = PositionManager(Exchange())
+
+    assert await manager.get_option_product_closest_to_premium(active, remaining, 1) is None
+
+
+@pytest.mark.asyncio
+async def test_position_detection_handles_index_failure_and_invalid_structures():
+    expiry = datetime(2026, 12, 31, tzinfo=timezone.utc)
+    put = OptionLeg(1, "P-90", "put", 90, expiry, -1, 2)
+    call = OptionLeg(2, "C-110", "call", 110, expiry, -1, 2)
+
+    class Exchange:
+        async def parse_option_positions(self):
+            return [put, call]
+
+        async def get_index_price(self, symbol):
+            raise RuntimeError("index unavailable")
+
+    manager = PositionManager(Exchange())
+
+    strangle = await manager.detect_short_strangle(require_otm=True)
+    assert strangle.put_leg is put
+    assert strangle.call_leg is call
+    with pytest.raises(RuntimeError, match="No short straddle"):
+        await manager.detect_short_straddle()
+
+
+@pytest.mark.asyncio
+async def test_position_detection_rejects_strangle_when_index_is_outside_strikes():
+    expiry = datetime(2026, 12, 31, tzinfo=timezone.utc)
+    put = OptionLeg(1, "P-90", "put", 90, expiry, -1, 2)
+    call = OptionLeg(2, "C-110", "call", 110, expiry, -1, 2)
+
+    class Exchange:
+        async def parse_option_positions(self):
+            return [put, call]
+
+        async def get_index_price(self, symbol):
+            return 80
+
+    with pytest.raises(RuntimeError, match="No short strangle"):
+        await PositionManager(Exchange()).detect_short_strangle(require_otm=True)

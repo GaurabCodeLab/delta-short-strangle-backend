@@ -64,6 +64,7 @@ class StrategyEngine:
         self._managed_legs: dict[int, OptionLeg] | None = None
         self._pnl_complete = True
         self._strategy_active = False
+        self._reference_premiums: dict[str, float] = {}
 
     def _set_status(self, message: str) -> None:
         self.state.status_message = message
@@ -242,6 +243,7 @@ class StrategyEngine:
                 and math.isclose(abs(put.size), abs(call.size), rel_tol=0, abs_tol=5e-4)
                 and put.strike <= call.strike
             ):
+                self._initialize_reference_premiums(put, call)
                 return ShortStrangle(put, call) if not math.isclose(put.strike, call.strike, abs_tol=1e-8) else ShortStraddle(put, call)
 
         if len(shorts) == 2 and len(puts) == 1 and len(calls) == 1:
@@ -250,6 +252,7 @@ class StrategyEngine:
             same_size = math.isclose(abs(put.size), abs(call.size), rel_tol=0, abs_tol=5e-4)
             if same_expiry and same_size and put.strike <= call.strike:
                 self._active_put_leg, self._active_call_leg = put, call
+                self._initialize_reference_premiums(put, call)
                 if math.isclose(put.strike, call.strike, rel_tol=0, abs_tol=1e-8):
                     return ShortStraddle(put, call)
                 return ShortStrangle(put, call)
@@ -265,7 +268,23 @@ class StrategyEngine:
         if put.expiry.date() != call.expiry.date() or not math.isclose(abs(put.size), abs(call.size), rel_tol=0, abs_tol=5e-4) or put.strike > call.strike:
             return None
         self._active_put_leg, self._active_call_leg = put, call
+        self._initialize_reference_premiums(put, call)
         return ShortStraddle(put, call) if math.isclose(put.strike, call.strike, rel_tol=0, abs_tol=1e-8) else ShortStrangle(put, call)
+
+    def _initialize_reference_premiums(self, put_leg, call_leg) -> None:
+        self._reference_premiums.setdefault("put", float(put_leg.entry_price))
+        self._reference_premiums.setdefault("call", float(call_leg.entry_price))
+
+    async def _reconcile_managed_position(self, product_id: int) -> OptionLeg | None:
+        positions = await self.exchange.parse_option_positions()
+        actual = next((leg for leg in positions if leg.product_id == product_id and abs(leg.size) > 0), None)
+        if self._managed_legs is None:
+            self._managed_legs = {}
+        if actual is None:
+            self._managed_legs.pop(product_id, None)
+        else:
+            self._managed_legs[product_id] = actual
+        return actual
 
     async def _submit_short_close(self, leg) -> None:
         size = abs(leg.size)
@@ -276,59 +295,92 @@ class StrategyEngine:
             reduce_only=True,
         )
         if filled + 1e-8 < size:
+            await self._reconcile_managed_position(leg.product_id)
             raise RuntimeError(f"Close was not fully filled for product {leg.product_id}: {filled}/{size}")
         await self._record_realized_pnl_for_close(leg)
         if self._managed_legs is not None:
             self._managed_legs.pop(leg.product_id, None)
 
-    async def _roll_short_leg(self, leg, remaining_leg, remaining_quote) -> None:
+    async def _roll_short_leg(self, trigger_leg, leg_to_replace) -> None:
         async with self._adjustment_lock:
-            current = await self.exchange.get_best_quote(leg.product_id)
-            if current.best_ask < 2 * leg.entry_price:
+            if trigger_leg.option_type.lower() == leg_to_replace.option_type.lower():
+                raise ValueError("A premium adjustment must replace the opposite option type")
+            if trigger_leg.expiry.date() != leg_to_replace.expiry.date():
+                raise ValueError("Active option legs must have the same expiry before adjustment")
+            if not math.isclose(abs(trigger_leg.size), abs(leg_to_replace.size), rel_tol=0, abs_tol=5e-4):
+                raise ValueError("Active option legs must have matching quantities before adjustment")
+
+            option_type = trigger_leg.option_type.lower()
+            reference_premium = self._reference_premiums.setdefault(option_type, float(trigger_leg.entry_price))
+            current = await self.exchange.get_best_quote(trigger_leg.product_id)
+            trigger_premium = reference_premium * self.settings.adjustment_multiplier
+            if current.best_ask < trigger_premium:
                 return
+            replacement_quote_target = float(current.best_ask)
             replacement = await self.positions.get_option_product_closest_to_premium(
-                active_leg=leg,
-                remaining_leg=remaining_leg,
-                target_premium=float(remaining_quote.best_bid),
+                active_leg=leg_to_replace,
+                remaining_leg=trigger_leg,
+                target_premium=replacement_quote_target,
             )
             if replacement is None:
-                LOGGER.warning("No narrowing replacement found for %s at premium %.8f", leg.symbol, remaining_quote.best_bid)
+                LOGGER.warning("No narrowing replacement found for %s at premium %.8f", leg_to_replace.symbol, replacement_quote_target)
                 return
 
+            replacement_type = PositionManager._normalize_option_type(replacement.get("contract_type"))
+            replacement_expiry = PositionManager._to_dt_safe(replacement.get("settlement_time"))
+            replacement_strike = float(replacement.get("strike_price") or 0)
+            if replacement_type and replacement_type != leg_to_replace.option_type.lower():
+                raise RuntimeError("Selected replacement has the wrong option type")
+            if replacement_expiry is None or replacement_expiry.date() != leg_to_replace.expiry.date():
+                raise RuntimeError("Selected replacement does not have the active expiry")
+            if not min(trigger_leg.strike, leg_to_replace.strike) <= replacement_strike <= max(trigger_leg.strike, leg_to_replace.strike):
+                raise RuntimeError("Selected replacement would not narrow the active strike gap")
+
             replacement_quote = await self.exchange.get_best_quote(int(replacement["id"]))
-            await self._submit_short_close(leg)
+            if replacement_quote.best_bid is None or replacement_quote.best_bid <= 0:
+                raise RuntimeError("Selected replacement does not have a valid bid quote")
+            await self._submit_short_close(leg_to_replace)
             filled = await self.executor.execute_market_single_submission_with_fill_confirmation(
                 product_id=int(replacement["id"]),
                 side="sell",
-                size=abs(leg.size),
+                size=abs(leg_to_replace.size),
                 reduce_only=False,
             )
-            if filled + 1e-8 < abs(leg.size):
-                raise RuntimeError(f"Replacement short was not fully filled for product {replacement['id']}")
+            if filled + 1e-8 < abs(leg_to_replace.size):
+                await self._reconcile_managed_position(int(replacement["id"]))
+                raise RuntimeError(f"Replacement short was not fully filled for product {replacement['id']}: {filled}/{abs(leg_to_replace.size)}")
             last_fill = getattr(self.executor, "last_fill_details", None)
             fill_price = last_fill.get("avg_fill_price") if isinstance(last_fill, dict) else None
-            replacement_leg = OptionLeg(
-                product_id=int(replacement["id"]),
-                symbol=str(replacement.get("symbol") or replacement["id"]),
-                option_type=leg.option_type,
-                strike=float(replacement["strike_price"]),
-                expiry=PositionManager._to_dt_safe(replacement.get("settlement_time")) or leg.expiry,
-                size=-float(filled),
-                entry_price=float(fill_price if fill_price is not None else replacement_quote.best_bid),
-                contract_value=float(replacement.get("contract_value") or leg.contract_value),
-            )
-            if self._managed_legs is not None:
+            replacement_leg = await self._reconcile_managed_position(int(replacement["id"]))
+            if replacement_leg is None and fill_price is not None:
+                replacement_leg = OptionLeg(
+                    product_id=int(replacement["id"]),
+                    symbol=str(replacement.get("symbol") or replacement["id"]),
+                    option_type=leg_to_replace.option_type,
+                    strike=replacement_strike,
+                    expiry=replacement_expiry,
+                    size=-float(filled),
+                    entry_price=float(fill_price),
+                    contract_value=float(replacement.get("contract_value") or leg_to_replace.contract_value),
+                )
                 self._managed_legs[replacement_leg.product_id] = replacement_leg
-            if leg.option_type.lower() == "put":
+            if replacement_leg is None:
+                raise RuntimeError(f"Replacement position {replacement['id']} could not be reconciled after execution")
+            if not math.isclose(abs(replacement_leg.size), abs(trigger_leg.size), rel_tol=0, abs_tol=5e-4):
+                raise RuntimeError(f"Replacement position {replacement['id']} quantity does not match the active leg")
+            if leg_to_replace.option_type.lower() == "put":
                 self._active_put_leg = replacement_leg
             else:
                 self._active_call_leg = replacement_leg
+            self._reference_premiums[option_type] = replacement_quote_target
             LOGGER.info(
-                "Rolled short %s product=%s to product=%s toward premium=%.8f",
-                leg.option_type,
-                leg.product_id,
+                "Premium adjustment trigger=%s kept_product=%s closed_product=%s replacement_product=%s reference_premium=%.8f replacement_entry=%.8f",
+                trigger_leg.option_type,
+                trigger_leg.product_id,
+                leg_to_replace.product_id,
                 replacement["id"],
-                remaining_quote.best_bid,
+                replacement_quote_target,
+                replacement_leg.entry_price,
             )
 
     @staticmethod
@@ -735,9 +787,13 @@ class StrategyEngine:
                 raise
             self.state.triggered = True
             self.state.exit_reason = reason
+            status = {
+                "profit": "Completed - Profit Target Reached",
+                "stop_loss": "Completed - Stop Loss Hit",
+            }.get(reason, f"Completed - {reason.replace('_', ' ').title()}")
             self._set_strategy_state(
                 action="completed",
-                status=f"Completed - {reason.replace('_', ' ').title()}",
+                status=status,
                 status_message=f"Strategy exit condition reached ({reason}); all open option positions were closed",
                 trigger_price=None,
                 trigger_pnl=self.state.trigger_pnl,
@@ -754,7 +810,9 @@ class StrategyEngine:
         if self._exit_started:
             return True
         if not self._strategy_active:
-            return False
+            if await self._find_active_short_pair() is None:
+                return False
+            self._strategy_active = True
         await self.refresh_live_state()
         combined_pnl = self.state.combined_pnl
         if combined_pnl is None or not self._pnl_complete:
@@ -800,13 +858,19 @@ class StrategyEngine:
                 call_quote = await self.exchange.get_best_quote(pair.call_leg.product_id)
                 self._set_strategy_state(
                     action="monitoring short strangle",
-                    status="waiting for premium doubling",
-                    status_message="monitoring each short leg for a 2x premium trigger",
+                    status="waiting for premium adjustment trigger",
+                    status_message=(
+                        "monitoring each short leg for a premium trigger at "
+                        f"{self.settings.adjustment_multiplier:g}x its current reference"
+                    ),
                 )
-                if pair.put_leg.entry_price > 0 and put_quote.best_ask >= 2 * pair.put_leg.entry_price:
-                    await self._roll_short_leg(pair.put_leg, pair.call_leg, call_quote)
-                elif pair.call_leg.entry_price > 0 and call_quote.best_ask >= 2 * pair.call_leg.entry_price:
-                    await self._roll_short_leg(pair.call_leg, pair.put_leg, put_quote)
+                put_reference = self._reference_premiums.get("put", pair.put_leg.entry_price)
+                call_reference = self._reference_premiums.get("call", pair.call_leg.entry_price)
+                multiplier = self.settings.adjustment_multiplier
+                if put_reference > 0 and put_quote.best_ask >= multiplier * put_reference:
+                    await self._roll_short_leg(pair.put_leg, pair.call_leg)
+                elif call_reference > 0 and call_quote.best_ask >= multiplier * call_reference:
+                    await self._roll_short_leg(pair.call_leg, pair.put_leg)
 
             if self._iron_fly_mode:
                 legs = list(self._managed_legs.values()) if self._managed_legs is not None else []
