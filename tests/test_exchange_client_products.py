@@ -8,6 +8,13 @@ from src.models import OptionLeg, Quote
 from src.position_manager import PositionManager
 
 
+def test_position_metadata_normalizers_handle_unknown_values():
+    assert PositionManager._normalize_option_type("future_contract") == ""
+    assert PositionManager._to_dt_safe("not-a-datetime") is None
+    assert PositionManager._to_dt_safe(object()) is None
+    assert PositionManager._to_dt_safe(1798675200).year == 2026
+
+
 @pytest.mark.asyncio
 async def test_get_products_raw_pagination_and_dedup():
     # prepare page payloads
@@ -145,8 +152,45 @@ async def test_strike_lookup_respects_iron_fly_wing_bounds():
     manager = PositionManager(Exchange())
 
     product = await manager.get_option_product_for_strike("call", 99, expiry, min_strike=100)
+    exact_product = await manager.get_option_product_for_strike("call", 110, expiry, min_strike=100)
 
     assert product["id"] == 1
+    assert exact_product["id"] == 2
+
+
+@pytest.mark.asyncio
+async def test_strike_lookup_skips_expired_exact_match_for_live_candidate():
+    expiry = datetime(2026, 12, 31, tzinfo=timezone.utc)
+
+    class Exchange:
+        async def get_products_raw(self):
+            return [
+                {"id": 1, "contract_type": "put_options", "strike_price": "100", "settlement_time": expiry.isoformat(), "state": "expired"},
+                {"id": 2, "contract_type": "put_options", "strike_price": "110", "settlement_time": expiry.isoformat(), "state": "live"},
+                {"id": 3, "contract_type": "put_options", "strike_price": "90", "settlement_time": expiry.isoformat(), "state": "live"},
+            ]
+
+    manager = PositionManager(Exchange())
+
+    product = await manager.get_option_product_for_strike("put", 100, expiry, min_strike=100)
+
+    assert product["id"] == 2
+
+
+@pytest.mark.asyncio
+async def test_strike_lookup_returns_none_for_unavailable_expiry_or_type():
+    expiry = datetime(2026, 12, 31, tzinfo=timezone.utc)
+
+    class Exchange:
+        async def get_products_raw(self):
+            return [
+                {"id": 1, "contract_type": "put_options", "strike_price": "90", "settlement_time": expiry.isoformat()},
+            ]
+
+    manager = PositionManager(Exchange())
+
+    assert await manager.get_option_product_for_strike("call", 100, expiry) is None
+    assert await manager.get_option_product_for_strike("put", 90, datetime(2027, 1, 31, tzinfo=timezone.utc)) is None
 
 
 @pytest.mark.asyncio
@@ -234,3 +278,34 @@ async def test_position_detection_rejects_strangle_when_index_is_outside_strikes
 
     with pytest.raises(RuntimeError, match="No short strangle"):
         await PositionManager(Exchange()).detect_short_strangle(require_otm=True)
+
+
+@pytest.mark.asyncio
+async def test_position_detection_reports_empty_account():
+    class Exchange:
+        async def parse_option_positions(self):
+            return []
+
+    with pytest.raises(RuntimeError, match="No open option positions"):
+        await PositionManager(Exchange()).detect_short_strangle()
+
+
+@pytest.mark.asyncio
+async def test_find_open_option_leg_matches_type_strike_expiry_and_side():
+    expiry = datetime(2026, 12, 31, tzinfo=timezone.utc)
+    legs = [
+        OptionLeg(1, "P-short", "put", 90, expiry, -1, 2),
+        OptionLeg(2, "C-long", "call", 110, expiry, 1, 3),
+    ]
+
+    class Exchange:
+        async def parse_option_positions(self):
+            return legs
+
+    manager = PositionManager(Exchange())
+
+    assert await manager.find_open_option_leg("put", 90, expiry, "short") is legs[0]
+    assert await manager.find_open_option_leg("call", 110, expiry, "long") is legs[1]
+    assert await manager.find_open_option_leg("call", 110, expiry, "short") is None
+    assert await manager.find_open_option_leg("put", 100, expiry, "short") is None
+    assert await manager.find_open_option_leg("put", 90, datetime(2027, 1, 1, tzinfo=timezone.utc), "short") is None

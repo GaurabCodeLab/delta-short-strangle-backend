@@ -364,7 +364,7 @@ async def test_order_executor_rejects_non_positive_size():
 
 
 @pytest.mark.asyncio
-async def test_order_executor_uses_meta_data_even_without_fill_data_in_order_history():
+async def test_order_executor_uses_reported_partial_quantity_with_order_metadata():
     class E:
         async def get_position_size(self, product_id: int):
             return 0.0
@@ -373,13 +373,34 @@ async def test_order_executor_uses_meta_data_even_without_fill_data_in_order_his
             return {"result": {"id": "ord-19"}}
 
         async def get_order(self, order_id: str, product_id: int | None = None):
+            return {"data": [{"filled_size": "0.4", "meta_data": {"pnl": "6.5", "avg_exit_price": "120.0"}}]}
+
+    executor = OrderExecutor(E())
+    filled = await executor.execute_market_single_submission_with_fill_confirmation(19, "sell", 1.0, False)
+    assert filled == pytest.approx(0.4)
+    assert executor.last_fill_details["filled_qty"] == pytest.approx(0.4)
+    assert executor.last_fill_details["realized_pnl"] == pytest.approx(6.5)
+    assert executor.last_fill_details["exit_price"] == pytest.approx(120.0)
+
+
+@pytest.mark.asyncio
+async def test_order_metadata_without_quantity_does_not_overstate_position_delta():
+    class E:
+        async def get_position_size(self, product_id: int):
+            return 0.0
+
+        async def place_market_order(self, **kwargs):
+            return {"result": {"id": "ord-no-quantity"}}
+
+        async def get_order(self, order_id: str, product_id: int | None = None):
             return {"data": [{"meta_data": {"pnl": "6.5", "avg_exit_price": "120.0"}}]}
 
     executor = OrderExecutor(E())
     filled = await executor.execute_market_single_submission_with_fill_confirmation(19, "sell", 1.0, False)
-    assert filled == 1.0
+
+    assert filled == 0.0
+    assert executor.last_fill_details["filled_qty"] == 0.0
     assert executor.last_fill_details["realized_pnl"] == pytest.approx(6.5)
-    assert executor.last_fill_details["exit_price"] == pytest.approx(120.0)
 
 
 @pytest.mark.asyncio

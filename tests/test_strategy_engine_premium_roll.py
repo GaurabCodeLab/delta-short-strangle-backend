@@ -20,8 +20,10 @@ class FakeExchange:
         self.legs = legs
         self.quotes = quotes or {}
         self.index_price = index_price
+        self.position_fetches = 0
 
     async def parse_option_positions(self):
+        self.position_fetches += 1
         return list(self.legs)
 
     async def get_best_quote(self, product_id):
@@ -70,7 +72,7 @@ class FakeExecutor:
 
 @pytest.fixture
 def settings():
-    return Settings("key", "secret", "test", 0.001, 10.0, 1e9, 1e9, 2.0, "INFO", False)
+    return Settings("key", "secret", "test", 0.001, 1e9, 1e9, 2.0, "INFO", False)
 
 
 def make_engine(exchange, positions, executor, settings):
@@ -83,10 +85,12 @@ async def test_waits_for_preexisting_matching_short_pair(settings):
     engine = make_engine(exchange, FakePositions(), FakeExecutor(exchange), settings)
 
     assert await engine._find_active_short_pair() is None
+    assert exchange.position_fetches == 1
     exchange.legs = [make_leg(1, "put", 90, -1, 2), make_leg(2, "call", 110, -1, 2)]
     pair = await engine._find_active_short_pair()
 
     assert pair is not None
+    assert exchange.position_fetches == 2
     assert pair.put_leg.product_id == 1
     assert pair.call_leg.product_id == 2
 
@@ -307,6 +311,41 @@ async def test_strategy_exit_submits_closes_only_once(settings):
 
     assert executor.calls == [(1, "buy", 1, True)]
     assert engine.state.status == "Completed - Profit Target Reached"
+
+
+@pytest.mark.asyncio
+async def test_strategy_pnl_marks_missing_quote_incomplete(settings):
+    leg = make_leg(1, "put", 90, -1, 2)
+
+    class MissingQuoteExchange(FakeExchange):
+        async def get_best_quote(self, product_id):
+            raise RuntimeError("quote unavailable")
+
+    exchange = MissingQuoteExchange([leg])
+    engine = make_engine(exchange, FakePositions(), FakeExecutor(exchange), settings)
+    engine._realized_pnl = 12.0
+
+    pnl = await engine._calculate_strategy_pnl()
+
+    assert pnl == (12.0, 0.0, 12.0)
+    assert engine._pnl_complete is False
+
+
+@pytest.mark.asyncio
+async def test_close_all_skips_zero_size_and_sells_long_option(settings):
+    zero_leg = make_leg(1, "put", 90, 0, 2)
+    long_leg = make_leg(2, "call", 110, 1, 3)
+    exchange = FakeExchange(
+        [zero_leg, long_leg],
+        {2: Quote(best_bid=4.0, best_ask=5.0)},
+    )
+    executor = FakeExecutor(exchange)
+    engine = make_engine(exchange, FakePositions(), executor, settings)
+
+    await engine._close_all_open_option_positions()
+
+    assert executor.calls == [(2, "sell", 1, True)]
+    assert engine._managed_legs == {zero_leg.product_id: zero_leg}
 
 
 @pytest.mark.asyncio

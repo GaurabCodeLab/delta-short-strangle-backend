@@ -157,7 +157,6 @@ def test_load_settings_valid_and_missing_env_values(monkeypatch):
     monkeypatch.setenv("DELTA_API_KEY", "key")
     monkeypatch.setenv("DELTA_API_SECRET", "secret")
     monkeypatch.setenv("POLL_INTERVAL_SECONDS", "0.75")
-    monkeypatch.setenv("STRIKE_ADJUSTMENT_THRESHOLD", "1500")
     monkeypatch.setenv("PROFIT_TARGET", "25")
     monkeypatch.setenv("STOP_LOSS", "75")
     monkeypatch.setenv("ADJUSTMENT_MULTIPLIER", "1.5")
@@ -169,7 +168,6 @@ def test_load_settings_valid_and_missing_env_values(monkeypatch):
     assert settings.api_key == "key"
     assert settings.api_secret == "secret"
     assert settings.poll_interval_seconds == 0.75
-    assert settings.strike_adjustment_threshold == 1500.0
     assert settings.profit_target == 25.0
     assert settings.stop_loss == 75.0
     assert settings.adjustment_multiplier == 1.5
@@ -991,7 +989,6 @@ def settings():
         api_secret="secret",
         base_url="https://test",
         poll_interval_seconds=0.1,
-        strike_adjustment_threshold=1000.0,
         profit_target=50.0,
         stop_loss=100.0,
         adjustment_multiplier=2.0,

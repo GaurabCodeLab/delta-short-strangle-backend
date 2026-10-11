@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, Dict
 
 from src.exchange_client import DeltaExchangeClient
@@ -171,6 +172,40 @@ class OrderExecutor:
                     return pnl
         return None
 
+    @staticmethod
+    def _extract_filled_quantity_from_payload(payload: Any) -> float | None:
+        if isinstance(payload, list):
+            for item in payload:
+                quantity = OrderExecutor._extract_filled_quantity_from_payload(item)
+                if quantity is not None:
+                    return quantity
+            return None
+        if not isinstance(payload, dict):
+            return None
+
+        for key in (
+            "filled_size",
+            "filled_quantity",
+            "filled_qty",
+            "executed_size",
+            "executed_quantity",
+            "executed_qty",
+        ):
+            if payload.get(key) is not None:
+                try:
+                    quantity = float(payload[key])
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(quantity) and quantity >= 0:
+                    return quantity
+
+        for key in ("result", "data", "order", "fill", "fills", "details"):
+            if key in payload:
+                quantity = OrderExecutor._extract_filled_quantity_from_payload(payload[key])
+                if quantity is not None:
+                    return quantity
+        return None
+
     async def execute_market_single_submission_with_fill_confirmation(
         self,
         product_id: int,
@@ -226,9 +261,12 @@ class OrderExecutor:
         avg_fill_price = self._extract_fill_price_from_payload(place_resp)
         exit_price = self._extract_exit_price_from_payload(place_resp)
         api_realized_pnl = self._extract_realized_pnl_from_payload(place_resp)
+        reported_filled_qty = self._extract_filled_quantity_from_payload(place_resp)
         if hasattr(self.exchange, "get_order"):
             try:
                 order_info = await self.exchange.get_order(order_id, product_id=product_id)
+                if reported_filled_qty is None:
+                    reported_filled_qty = self._extract_filled_quantity_from_payload(order_info)
                 if avg_fill_price is None:
                     avg_fill_price = self._extract_fill_price_from_payload(order_info)
                 if exit_price is None:
@@ -243,8 +281,8 @@ class OrderExecutor:
         if exit_price is None:
             exit_price = avg_fill_price
 
-        if (api_realized_pnl is not None or exit_price is not None or avg_fill_price is not None) and size > 0:
-            confirmed = float(size)
+        if reported_filled_qty is not None:
+            confirmed = max(confirmed, min(size, reported_filled_qty))
 
         self.last_fill_details = {
             "product_id": product_id,

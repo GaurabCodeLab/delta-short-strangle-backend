@@ -16,7 +16,6 @@ class Settings:
     api_secret: str
     base_url: str
     poll_interval_seconds: float
-    strike_adjustment_threshold: float
     profit_target: float
     stop_loss: float
     adjustment_multiplier: float
@@ -49,7 +48,6 @@ def load_settings() -> Settings:
         api_secret=api_secret,
         base_url=os.getenv("DELTA_BASE_URL", "https://cdn-ind.testnet.deltaex.org"),
         poll_interval_seconds=poll_interval,
-        strike_adjustment_threshold=float(os.getenv("STRIKE_ADJUSTMENT_THRESHOLD", "1000")),
         profit_target=float(os.getenv("PROFIT_TARGET", "50")),
         stop_loss=float(os.getenv("STOP_LOSS", "100")),
         adjustment_multiplier=adjustment_multiplier,

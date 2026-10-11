@@ -9,8 +9,8 @@ Python async trading bot for Delta Exchange BTC options. It waits for an existin
   - `position_manager.py` (position discovery and live state)
   - `strategy_engine.py` (premium-roll and Iron Fly state machine)
   - `order_executor.py` (market order placement + fill confirmation)
-- Rolls an individual short strangle leg after its current ask reaches twice its entry premium
-- Selects a same-expiry replacement whose bid premium is closest to the opposite leg and whose strike narrows the gap
+- Rolls the opposite short strangle leg when either active leg's current ask reaches its latest reference premium multiplied by `ADJUSTMENT_MULTIPLIER`
+- Selects a same-expiry replacement whose bid premium is closest to the triggering leg's live ask and whose strike narrows the gap
 - Converts a resulting short straddle to an Iron Fly with quantity-matched long call and put wings near its breakevens
 - Monitors strategy PnL and Iron Fly breakevens, closing all managed option legs on an exit condition
 - Detailed structured logging
@@ -20,7 +20,7 @@ Python async trading bot for Delta Exchange BTC options. It waits for an existin
 ### Strategy Lifecycle
 
 1. The bot waits for exactly one short call and one short put with the same expiry and quantity. A pre-existing short straddle is accepted and proceeds directly to Iron Fly setup.
-2. While the position is a strangle, each leg is monitored independently using its best ask as the estimated close premium. At 2x its own entry premium, the bot closes that leg and sells a same-expiry option of the same type and quantity. The replacement is selected by closest best bid to the remaining leg's best bid, restricted to strikes between the two current strikes.
+2. While the position is a strangle, each leg is monitored independently using its best ask as the estimated close premium. When that ask reaches its side's latest reference premium times `ADJUSTMENT_MULTIPLIER`, the triggering leg stays open and the opposite leg is closed and replaced with a same-expiry option of the same type and quantity. The replacement bid is selected to be closest to the triggering leg's live ask, with strikes restricted to the current gap.
 3. When the two short legs share a strike, the bot buys a put wing below and a call wing above that strike, nearest to the short straddle's premium-based breakevens. Wing quantity matches the short quantity.
 4. The bot exits all managed option legs at the configured total-PnL profit target, loss limit, or when BTC reaches/passes either calculated Iron Fly breakeven.
 
