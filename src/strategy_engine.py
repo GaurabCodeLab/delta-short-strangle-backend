@@ -35,6 +35,10 @@ class StrategyState:
     stop_loss: Optional[float] = None
     exit_reason: Optional[str] = None
     iron_fly_breakevens: Optional[tuple[float, float]] = None
+    reference_premiums: Optional[dict[str, float]] = None
+    adjustment_thresholds: Optional[dict[str, float]] = None
+    live_best_asks: Optional[dict[str, float]] = None
+    adjustment_candidate: Optional[dict[str, float | str | None]] = None
 
 
 class StrategyEngine:
@@ -567,6 +571,11 @@ class StrategyEngine:
             self._strategy_active = True
 
             if isinstance(pair, ShortStraddle):
+                self.state.current_structure = "straddle"
+                self.state.reference_premiums = None
+                self.state.adjustment_thresholds = None
+                self.state.live_best_asks = None
+                self.state.adjustment_candidate = None
                 await self._ensure_iron_fly(pair)
             else:
                 self.state.current_structure = "strangle"
@@ -583,9 +592,40 @@ class StrategyEngine:
                 put_reference = self._reference_premiums.get("put", pair.put_leg.entry_price)
                 call_reference = self._reference_premiums.get("call", pair.call_leg.entry_price)
                 multiplier = self.settings.adjustment_multiplier
-                if put_reference > 0 and put_quote.best_ask >= multiplier * put_reference:
+                put_threshold = multiplier * put_reference
+                call_threshold = multiplier * call_reference
+                self.state.reference_premiums = {
+                    "put": float(put_reference),
+                    "call": float(call_reference),
+                }
+                self.state.adjustment_thresholds = {
+                    "put": float(put_threshold),
+                    "call": float(call_threshold),
+                }
+                self.state.live_best_asks = {
+                    "put": float(put_quote.best_ask),
+                    "call": float(call_quote.best_ask),
+                }
+                self.state.adjustment_candidate = None
+                if put_reference > 0 and put_quote.best_ask >= put_threshold:
+                    self.state.adjustment_candidate = {
+                        "side": "put",
+                        "triggering_side": "put",
+                        "replaced_side": "call",
+                        "reference_premium": float(put_reference),
+                        "threshold_premium": float(put_threshold),
+                        "current_best_ask": float(put_quote.best_ask),
+                    }
                     await self._roll_short_leg(pair.put_leg, pair.call_leg)
-                elif call_reference > 0 and call_quote.best_ask >= multiplier * call_reference:
+                elif call_reference > 0 and call_quote.best_ask >= call_threshold:
+                    self.state.adjustment_candidate = {
+                        "side": "call",
+                        "triggering_side": "call",
+                        "replaced_side": "put",
+                        "reference_premium": float(call_reference),
+                        "threshold_premium": float(call_threshold),
+                        "current_best_ask": float(call_quote.best_ask),
+                    }
                     await self._roll_short_leg(pair.call_leg, pair.put_leg)
 
             if self._iron_fly_mode:

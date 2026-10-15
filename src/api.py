@@ -224,6 +224,11 @@ class BotManager:
             "current_structure": self.strategy.state.current_structure,
             "threshold": self.strategy.state.threshold,
             "last_transition": self.strategy.state.last_transition,
+            "adjustment_multiplier": getattr(
+                getattr(self.strategy, "settings", None),
+                "adjustment_multiplier",
+                None,
+            ),
             "combined_pnl": self.strategy.state.combined_pnl,
             "profit_target": self.strategy.state.profit_target,
             "stop_loss": self.strategy.state.stop_loss,
@@ -234,6 +239,10 @@ class BotManager:
             "trigger_price": self.strategy.state.trigger_price,
             "trigger_pnl": self.strategy.state.trigger_pnl,
             "iron_fly_breakevens": getattr(self.strategy.state, "iron_fly_breakevens", None),
+            "reference_premiums": getattr(self.strategy.state, "reference_premiums", None),
+            "adjustment_thresholds": getattr(self.strategy.state, "adjustment_thresholds", None),
+            "live_best_asks": getattr(self.strategy.state, "live_best_asks", None),
+            "adjustment_candidate": getattr(self.strategy.state, "adjustment_candidate", None),
         }
 
         if not self.strategy.state.status_message:
