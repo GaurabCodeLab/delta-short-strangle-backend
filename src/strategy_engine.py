@@ -56,6 +56,10 @@ class StrategyEngine:
         self.state = StrategyState()
         self._adjustment_lock = asyncio.Lock()
         self._exit_lock = asyncio.Lock()
+        self._conversion_started = False
+        self._conversion_source_pair: ShortStrangle | None = None
+        self._conversion_target_strike: float | None = None
+        self._conversion_trigger_side: str | None = None
         self._current_structure: str = "unknown"
         self._realized_pnl = 0.0
         self.closed_positions: list[dict] = []
@@ -265,6 +269,9 @@ class StrategyEngine:
 
     async def _roll_short_leg(self, trigger_leg, leg_to_replace) -> None:
         async with self._adjustment_lock:
+            if self._conversion_started or self._iron_fly_mode:
+                LOGGER.info("Skipping premium adjustment because Iron Fly conversion is active")
+                return
             if trigger_leg.option_type.lower() == leg_to_replace.option_type.lower():
                 raise ValueError("A premium adjustment must replace the opposite option type")
             if trigger_leg.expiry.date() != leg_to_replace.expiry.date():
@@ -344,6 +351,230 @@ class StrategyEngine:
                 replacement_quote_target,
                 replacement_leg.entry_price,
             )
+
+    @staticmethod
+    def _index_touch_target(pair: ShortStrangle, index_price: float) -> tuple[str, float] | None:
+        if index_price >= pair.call_leg.strike:
+            return "call", float(pair.call_leg.strike)
+        if index_price <= pair.put_leg.strike:
+            return "put", float(pair.put_leg.strike)
+        return None
+
+    def _clear_conversion_request(self) -> None:
+        self._conversion_started = False
+        self._conversion_source_pair = None
+        self._conversion_target_strike = None
+        self._conversion_trigger_side = None
+
+    async def _convert_strangle_to_iron_fly(
+        self,
+        pair: ShortStrangle | None,
+        index_price: float | None,
+    ) -> ShortStraddle | None:
+        adjustment_in_progress = self._adjustment_lock.locked()
+        if not self._conversion_started:
+            if pair is None or index_price is None:
+                return None
+            target = self._index_touch_target(pair, index_price)
+            if target is None:
+                return None
+            self._conversion_trigger_side, self._conversion_target_strike = target
+            self._conversion_source_pair = pair
+            self._conversion_started = True
+
+        async with self._adjustment_lock:
+            if self._iron_fly_mode:
+                self._clear_conversion_request()
+                return None
+
+            fetched = await self.exchange.parse_option_positions()
+            self._managed_legs = {leg.product_id: leg for leg in fetched}
+            short_pair = self._build_short_pair(fetched)
+            current_pair = None
+            if short_pair is not None:
+                put_leg, call_leg = short_pair
+                current_pair = (
+                    ShortStraddle(put_leg, call_leg)
+                    if math.isclose(put_leg.strike, call_leg.strike, rel_tol=0, abs_tol=1e-8)
+                    else ShortStrangle(put_leg, call_leg)
+                )
+
+            if isinstance(current_pair, ShortStraddle):
+                await self._ensure_iron_fly(current_pair)
+                self.state.last_transition = "strangle->iron_fly"
+                self.state.reference_premiums = None
+                self.state.adjustment_thresholds = None
+                self.state.live_best_asks = None
+                self.state.adjustment_candidate = None
+                self._clear_conversion_request()
+                return current_pair
+
+            if adjustment_in_progress and isinstance(current_pair, ShortStrangle):
+                latest_index = await self.exchange.get_index_price("BTCUSDT")
+                latest_target = self._index_touch_target(current_pair, latest_index)
+                if latest_target is None:
+                    self._clear_conversion_request()
+                    return None
+                self._conversion_trigger_side, self._conversion_target_strike = latest_target
+                self._conversion_source_pair = current_pair
+
+            source_pair = self._conversion_source_pair
+            target_strike = self._conversion_target_strike
+            trigger_side = self._conversion_trigger_side
+            if source_pair is None or target_strike is None or trigger_side not in {"call", "put"}:
+                raise RuntimeError("Index-triggered Iron Fly conversion has no recoverable target")
+
+            if isinstance(current_pair, ShortStrangle):
+                trigger_leg = current_pair.call_leg if trigger_side == "call" else current_pair.put_leg
+                if not math.isclose(trigger_leg.strike, target_strike, rel_tol=0, abs_tol=1e-8):
+                    raise RuntimeError("Active short leg no longer matches the conversion strike")
+                replace_side = "put" if trigger_side == "call" else "call"
+                old_leg = current_pair.put_leg if replace_side == "put" else current_pair.call_leg
+            else:
+                source_trigger = source_pair.call_leg if trigger_side == "call" else source_pair.put_leg
+                trigger_leg = next(
+                    (
+                        leg for leg in fetched
+                        if leg.size < 0
+                        and leg.option_type.lower() == trigger_side
+                        and math.isclose(leg.strike, target_strike, rel_tol=0, abs_tol=1e-8)
+                        and leg.expiry.date() == source_trigger.expiry.date()
+                    ),
+                    None,
+                )
+                if trigger_leg is None:
+                    raise RuntimeError("Unable to reconcile the triggering short leg for conversion")
+                replace_side = "put" if trigger_side == "call" else "call"
+                old_leg = None
+
+            expiry = trigger_leg.expiry
+            quantity = abs(trigger_leg.size)
+            product = await self.positions.get_option_product_for_strike(
+                replace_side, target_strike, expiry
+            )
+            if product is None:
+                raise RuntimeError(f"No {replace_side} product exists at conversion strike {target_strike}")
+
+            product_type = PositionManager._normalize_option_type(product.get("contract_type"))
+            product_expiry = PositionManager._to_dt_safe(product.get("settlement_time"))
+            product_strike = float(product.get("strike_price") or 0)
+            if product_type and product_type != replace_side:
+                raise RuntimeError("Selected conversion product has the wrong option type")
+            if product_expiry is None or product_expiry.date() != expiry.date():
+                raise RuntimeError("Selected conversion product does not have the active expiry")
+            if not math.isclose(product_strike, target_strike, rel_tol=0, abs_tol=1e-8):
+                raise RuntimeError("No exact opposite-side option exists at the conversion strike")
+
+            replacement_product_id = int(product["id"])
+            replacement_quote = await self.exchange.get_best_quote(replacement_product_id)
+            if replacement_quote.best_bid is None or replacement_quote.best_bid <= 0:
+                raise RuntimeError("Selected conversion product does not have a valid bid quote")
+
+            old_positions = [
+                leg for leg in fetched
+                if leg.size < 0
+                and leg.option_type.lower() == replace_side
+                and leg.expiry.date() == expiry.date()
+                and leg.product_id != replacement_product_id
+            ]
+            if old_leg is not None and all(leg.product_id != old_leg.product_id for leg in old_positions):
+                old_positions.append(old_leg)
+            for leg in old_positions:
+                if any(actual.product_id == leg.product_id and actual.size < 0 for actual in fetched):
+                    await self._submit_short_close(leg)
+
+            refreshed = await self.exchange.parse_option_positions()
+            self._managed_legs = {leg.product_id: leg for leg in refreshed}
+            target_position = next(
+                (
+                    leg for leg in refreshed
+                    if leg.product_id == replacement_product_id and leg.size < 0
+                ),
+                None,
+            )
+            existing_quantity = abs(target_position.size) if target_position is not None else 0.0
+            if existing_quantity > quantity + 5e-4:
+                excess = existing_quantity - quantity
+                filled = await self.executor.execute_market_single_submission_with_fill_confirmation(
+                    product_id=replacement_product_id,
+                    side="buy",
+                    size=excess,
+                    reduce_only=True,
+                )
+                if filled + 1e-8 < excess:
+                    await self._reconcile_managed_position(replacement_product_id)
+                    raise RuntimeError("Excess conversion-strike short quantity was not fully closed")
+                if target_position is not None:
+                    excess_leg = OptionLeg(
+                        product_id=target_position.product_id,
+                        symbol=target_position.symbol,
+                        option_type=target_position.option_type,
+                        strike=target_position.strike,
+                        expiry=target_position.expiry,
+                        size=-excess,
+                        entry_price=target_position.entry_price,
+                        contract_value=target_position.contract_value,
+                    )
+                    await self._record_realized_pnl_for_close(excess_leg)
+                existing_quantity = quantity
+
+            order_quantity = quantity - existing_quantity
+            if order_quantity > 5e-4:
+                filled = await self.executor.execute_market_single_submission_with_fill_confirmation(
+                    product_id=replacement_product_id,
+                    side="sell",
+                    size=order_quantity,
+                    reduce_only=False,
+                )
+                if filled + 1e-8 < order_quantity:
+                    await self._reconcile_managed_position(replacement_product_id)
+                    raise RuntimeError(
+                        f"Conversion-strike short was not fully filled: {filled}/{order_quantity}"
+                    )
+
+            refreshed = await self.exchange.parse_option_positions()
+            self._managed_legs = {leg.product_id: leg for leg in refreshed}
+            replacement_leg = next(
+                (
+                    leg for leg in refreshed
+                    if leg.product_id == replacement_product_id and leg.size < 0
+                ),
+                None,
+            )
+            if replacement_leg is None:
+                last_fill = getattr(self.executor, "last_fill_details", None)
+                fill_price = last_fill.get("avg_fill_price") if isinstance(last_fill, dict) else None
+                replacement_leg = OptionLeg(
+                    product_id=replacement_product_id,
+                    symbol=str(product.get("symbol") or replacement_product_id),
+                    option_type=replace_side,
+                    strike=target_strike,
+                    expiry=expiry,
+                    size=-quantity,
+                    entry_price=float(fill_price if fill_price is not None else replacement_quote.best_bid),
+                    contract_value=float(product.get("contract_value") or trigger_leg.contract_value),
+                )
+                self._managed_legs[replacement_product_id] = replacement_leg
+            if not math.isclose(abs(replacement_leg.size), quantity, rel_tol=0, abs_tol=5e-4):
+                raise RuntimeError("Conversion-strike short quantity does not match the active leg")
+
+            put_leg = trigger_leg if trigger_side == "put" else replacement_leg
+            call_leg = trigger_leg if trigger_side == "call" else replacement_leg
+            straddle = ShortStraddle(put_leg=put_leg, call_leg=call_leg)
+            self._active_put_leg, self._active_call_leg = put_leg, call_leg
+            await self._ensure_iron_fly(straddle)
+            self.state.last_transition = "strangle->iron_fly"
+            self.state.reference_premiums = None
+            self.state.adjustment_thresholds = None
+            self.state.live_best_asks = None
+            self.state.adjustment_candidate = None
+            self._clear_conversion_request()
+            LOGGER.info(
+                "Index strike reached; converted short strangle to Iron Fly at strike=%s trigger_side=%s",
+                target_strike,
+                trigger_side,
+            )
+            return straddle
 
     @staticmethod
     def _expiry_pnl_at_price(legs, price: float) -> float:
@@ -560,14 +791,30 @@ class StrategyEngine:
 
             pair = await self._find_active_short_pair()
             if pair is None:
-                self.state.current_structure = "unknown"
-                self._set_strategy_state(
-                    action="waiting for short strangle",
-                    status="initial position missing",
-                    status_message="waiting for one short call and one short put with matching expiry and quantity",
-                )
-                await asyncio.sleep(self.settings.poll_interval_seconds)
-                continue
+                if self._conversion_started:
+                    try:
+                        pair = await self._convert_strangle_to_iron_fly(None, index_price)
+                    except Exception as exc:
+                        LOGGER.exception("Unable to complete pending index-triggered Iron Fly conversion")
+                        self._set_strategy_state(
+                            action="converting to iron fly",
+                            status="conversion pending",
+                            status_message=f"reconciling positions before Iron Fly conversion: {exc}",
+                        )
+                        await asyncio.sleep(self.settings.poll_interval_seconds)
+                        continue
+                    if pair is None:
+                        await asyncio.sleep(self.settings.poll_interval_seconds)
+                        continue
+                else:
+                    self.state.current_structure = "unknown"
+                    self._set_strategy_state(
+                        action="waiting for short strangle",
+                        status="initial position missing",
+                        status_message="waiting for one short call and one short put with matching expiry and quantity",
+                    )
+                    await asyncio.sleep(self.settings.poll_interval_seconds)
+                    continue
             self._strategy_active = True
 
             if isinstance(pair, ShortStraddle):
@@ -577,56 +824,75 @@ class StrategyEngine:
                 self.state.live_best_asks = None
                 self.state.adjustment_candidate = None
                 await self._ensure_iron_fly(pair)
+                if self._iron_fly_mode:
+                    self._clear_conversion_request()
             else:
                 self.state.current_structure = "strangle"
-                put_quote = await self.exchange.get_best_quote(pair.put_leg.product_id)
-                call_quote = await self.exchange.get_best_quote(pair.call_leg.product_id)
-                self._set_strategy_state(
-                    action="monitoring short strangle",
-                    status="waiting for premium adjustment trigger",
-                    status_message=(
-                        "monitoring each short leg for a premium trigger at "
-                        f"{self.settings.adjustment_multiplier:g}x its current reference"
-                    ),
-                )
-                put_reference = self._reference_premiums.get("put", pair.put_leg.entry_price)
-                call_reference = self._reference_premiums.get("call", pair.call_leg.entry_price)
-                multiplier = self.settings.adjustment_multiplier
-                put_threshold = multiplier * put_reference
-                call_threshold = multiplier * call_reference
-                self.state.reference_premiums = {
-                    "put": float(put_reference),
-                    "call": float(call_reference),
-                }
-                self.state.adjustment_thresholds = {
-                    "put": float(put_threshold),
-                    "call": float(call_threshold),
-                }
-                self.state.live_best_asks = {
-                    "put": float(put_quote.best_ask),
-                    "call": float(call_quote.best_ask),
-                }
-                self.state.adjustment_candidate = None
-                if put_reference > 0 and put_quote.best_ask >= put_threshold:
-                    self.state.adjustment_candidate = {
-                        "side": "put",
-                        "triggering_side": "put",
-                        "replaced_side": "call",
-                        "reference_premium": float(put_reference),
-                        "threshold_premium": float(put_threshold),
-                        "current_best_ask": float(put_quote.best_ask),
+                touch = self._index_touch_target(pair, index_price) if index_price is not None else None
+                if self._conversion_started or touch is not None:
+                    try:
+                        pair = await self._convert_strangle_to_iron_fly(pair, index_price)
+                    except Exception as exc:
+                        LOGGER.exception("Unable to complete index-triggered Iron Fly conversion")
+                        self._set_strategy_state(
+                            action="converting to iron fly",
+                            status="conversion pending",
+                            status_message=f"reconciling positions before Iron Fly conversion: {exc}",
+                        )
+                        await asyncio.sleep(self.settings.poll_interval_seconds)
+                        continue
+                    if pair is None:
+                        await asyncio.sleep(self.settings.poll_interval_seconds)
+                        continue
+                else:
+                    put_quote = await self.exchange.get_best_quote(pair.put_leg.product_id)
+                    call_quote = await self.exchange.get_best_quote(pair.call_leg.product_id)
+                    self._set_strategy_state(
+                        action="monitoring short strangle",
+                        status="waiting for premium adjustment trigger",
+                        status_message=(
+                            "monitoring each short leg for a premium trigger at "
+                            f"{self.settings.adjustment_multiplier:g}x its current reference"
+                        ),
+                    )
+                    put_reference = self._reference_premiums.get("put", pair.put_leg.entry_price)
+                    call_reference = self._reference_premiums.get("call", pair.call_leg.entry_price)
+                    multiplier = self.settings.adjustment_multiplier
+                    put_threshold = multiplier * put_reference
+                    call_threshold = multiplier * call_reference
+                    self.state.reference_premiums = {
+                        "put": float(put_reference),
+                        "call": float(call_reference),
                     }
-                    await self._roll_short_leg(pair.put_leg, pair.call_leg)
-                elif call_reference > 0 and call_quote.best_ask >= call_threshold:
-                    self.state.adjustment_candidate = {
-                        "side": "call",
-                        "triggering_side": "call",
-                        "replaced_side": "put",
-                        "reference_premium": float(call_reference),
-                        "threshold_premium": float(call_threshold),
-                        "current_best_ask": float(call_quote.best_ask),
+                    self.state.adjustment_thresholds = {
+                        "put": float(put_threshold),
+                        "call": float(call_threshold),
                     }
-                    await self._roll_short_leg(pair.call_leg, pair.put_leg)
+                    self.state.live_best_asks = {
+                        "put": float(put_quote.best_ask),
+                        "call": float(call_quote.best_ask),
+                    }
+                    self.state.adjustment_candidate = None
+                    if put_reference > 0 and put_quote.best_ask >= put_threshold:
+                        self.state.adjustment_candidate = {
+                            "side": "put",
+                            "triggering_side": "put",
+                            "replaced_side": "call",
+                            "reference_premium": float(put_reference),
+                            "threshold_premium": float(put_threshold),
+                            "current_best_ask": float(put_quote.best_ask),
+                        }
+                        await self._roll_short_leg(pair.put_leg, pair.call_leg)
+                    elif call_reference > 0 and call_quote.best_ask >= call_threshold:
+                        self.state.adjustment_candidate = {
+                            "side": "call",
+                            "triggering_side": "call",
+                            "replaced_side": "put",
+                            "reference_premium": float(call_reference),
+                            "threshold_premium": float(call_threshold),
+                            "current_best_ask": float(call_quote.best_ask),
+                        }
+                        await self._roll_short_leg(pair.call_leg, pair.put_leg)
 
             if self._iron_fly_mode:
                 legs = list(self._managed_legs.values()) if self._managed_legs is not None else []
